@@ -305,7 +305,10 @@ impl Installer {
         ));
 
         let mut dialog = ui::programbox_start("Installing", "Running installation...")?;
-        let stdin = dialog.stdin.take().unwrap();
+        let stdin = dialog
+            .stdin
+            .take()
+            .ok_or_else(|| Error::Internal("dialog has no stdin".into()))?;
         let stdin = Arc::new(Mutex::new(stdin));
 
         for cmd in commands {
@@ -325,33 +328,55 @@ impl Installer {
 
             // stdout thread
             let stdin_out = Arc::clone(&stdin);
-            let stdout = child.stdout.take().unwrap();
-            let t1 = thread::spawn(move || -> Result<()> {
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| Error::Internal("child has no stdout".into()))?;
+            let t1 = thread::spawn(move || -> Result<String> {
                 let reader = BufReader::new(stdout);
+                let mut collected = String::new();
                 for line in reader.lines() {
+                    let line = line?;
                     let mut stdin = stdin_out.lock().unwrap();
-                    writeln!(stdin, "{}", line?)?;
+                    writeln!(stdin, "{}", line)?;
+                    collected.push_str(&line);
+                    collected.push('\n');
                 }
-                Ok(())
+                Ok(collected)
             });
 
             // stderr thread
             let stdin_err = Arc::clone(&stdin);
-            let stderr = child.stderr.take().unwrap();
-            let t2 = thread::spawn(move || -> Result<()> {
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| Error::Internal("child has no stderr".into()))?;
+            let t2 = thread::spawn(move || -> Result<String> {
                 let reader = BufReader::new(stderr);
+                let mut collected = String::new();
                 for line in reader.lines() {
+                    let line = line?;
                     let mut stdin = stdin_err.lock().unwrap();
-                    writeln!(stdin, "{}", line?)?;
+                    writeln!(stdin, "{}", line)?;
+                    collected.push_str(&line);
+                    collected.push('\n');
                 }
-                Ok(())
+                Ok(collected)
             });
 
-            t1.join().unwrap()?;
-            t2.join().unwrap()?;
+            let cmd_stdout = t1
+                .join()
+                .map_err(|_| Error::Internal("stdout reader thread panicked".into()))??;
+            let cmd_stderr = t2
+                .join()
+                .map_err(|_| Error::Internal("stderr reader thread panicked".into()))??;
 
             if !child.wait()?.success() {
-                return Err(Error::InstallError(cmd_display));
+                return Err(Error::InstallCommandFailed {
+                    cmd: cmd_display,
+                    stdout: cmd_stdout,
+                    stderr: cmd_stderr,
+                });
             }
         }
 
@@ -380,15 +405,39 @@ impl Installer {
 
             for username in passwordless_users {
                 let password = loop {
-                    let password = ui::passwordbox(
+                    let password = match ui::passwordbox(
                         &format!("Password for {username}"),
                         &format!("Enter the password for user: {username}"),
-                    )?;
+                    ) {
+                        Ok(p) => p,
+                        Err(Error::Cancelled) => {
+                            ui::msgbox(
+                                "Password selection cancellation",
+                                "You cannot cancel out of this operation",
+                            )?;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    };
 
-                    let password1 = ui::passwordbox(
+                    let password1 = match ui::passwordbox(
                         &format!("Password for {username}"),
                         &format!("Repeat the password for user: {username}"),
-                    )?;
+                    ) {
+                        Ok(p) => p,
+                        Err(Error::Cancelled) => {
+                            ui::msgbox(
+                                "Password selection cancellation",
+                                "You cannot cancel out of this operation",
+                            )?;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    };
 
                     if password == password1 {
                         break password;
@@ -400,23 +449,33 @@ impl Installer {
                     )?;
                 };
 
-                let mut child = Command::new(chroot)
-                    .args(["/mnt", "chpasswd"])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()?;
+                let output = if password.is_empty() {
+                    Command::new(chroot)
+                        .args(["/mnt", "passwd", "--delete", &username])
+                        .output()?
+                } else {
+                    let mut child = Command::new(chroot)
+                        .args(["/mnt", "chpasswd"])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()?;
 
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(format!("{username}:{password}").as_bytes())?;
+                    child
+                        .stdin
+                        .take()
+                        .ok_or_else(|| Error::Internal("chpasswd has no stdin".into()))?
+                        .write_all(format!("{username}:{password}").as_bytes())?;
 
-                if !child.wait()?.success() {
-                    return Err(Error::InstallError(format!(
-                        "Failed to set password for {username}"
-                    )));
+                    child.wait_with_output()?
+                };
+
+                if !output.status.success() {
+                    return Err(Error::InstallCommandFailed {
+                        cmd: format!("{chroot} /mnt chpasswd  # setting password for {username}"),
+                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                    });
                 }
             }
         }

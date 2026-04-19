@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::{cmdp, ui};
 
 use std::collections::HashMap;
@@ -262,7 +262,7 @@ impl Partitioner {
         let disks = self.get_disks();
         if disks.is_empty() {
             ui::msgbox("Error", "No suitable disks found!")?;
-            return Ok(());
+            return Err(Error::Cancelled);
         }
 
         let items: Vec<(String, String)> = disks
@@ -270,97 +270,145 @@ impl Partitioner {
             .map(|d| {
                 let label = format!(
                     "{} ({}{})",
-                    d.path.clone(),
-                    d.size.clone(),
+                    d.path,
+                    d.size,
                     d.model
-                        .clone()
-                        .map_or(String::new(), |m| m.trim().to_string())
+                        .as_deref()
+                        .map_or(String::new(), |m| format!(", {}", m.trim())),
                 );
-
                 (d.path.clone(), label)
             })
             .collect();
 
-        let selected = ui::menu(
-            "Simple Partitioning",
-            "Select disk for NEOARCH installation:",
-            &items,
-        )?;
+        loop {
+            let selected = match ui::menu(
+                "Simple Partitioning",
+                "Select disk for NeoArch installation:",
+                &items,
+            ) {
+                Ok(s) => s,
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(e) => return Err(e),
+            };
 
-        let disk = disks.iter().find(|d| d.path == selected).unwrap();
+            let disk = disks.iter().find(|d| d.path == selected).unwrap();
 
-        let confirm = format!(
-            "WARNING: This will ERASE ALL DATA on {} ({})\n\n\
-             Layout to create:\n\
-             - {} (1GB FAT32) → /boot/efi\n\
-             - {} (Btrfs) with subvolumes:\n\
-             {}\n\n\
-             Proceed with destruction?",
-            disk.path,
-            disk.model.clone().unwrap_or("MODEL UNKNOWN".to_string()),
-            Self::partition_path(&disk.path, 1),
-            Self::partition_path(&disk.path, 2),
-            SIMPLE_PARTITIONING_SUBVOLUMES
-                .iter()
-                .map(|(name, path)| format!(
-                    "+-- {name} ({})",
-                    if *path == "/" { "root" } else { path }
-                ))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+            let confirm = format!(
+                "WARNING: This will ERASE ALL DATA on {} ({})\n\n\
+                 Layout to create:\n\
+                 - {} (1 GB, FAT32) → /boot/efi\n\
+                 - {} (Btrfs) with subvolumes:\n\
+                 {}\n\n\
+                 Proceed with destruction?",
+                disk.path,
+                disk.model.as_deref().unwrap_or("MODEL UNKNOWN"),
+                Self::partition_path(&disk.path, 1),
+                Self::partition_path(&disk.path, 2),
+                SIMPLE_PARTITIONING_SUBVOLUMES
+                    .iter()
+                    .map(|(name, path)| format!(
+                        "  +-- {name} ({})",
+                        if *path == "/" { "root" } else { path }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
 
-        if !ui::yesno("Confirm Destructive Operation", &confirm)? {
+            if !ui::yesno("Confirm Destructive Operation", &confirm)? {
+                continue;
+            }
+
+            self.current_plan = Some(PartitionPlan::Simple {
+                device: disk.path.clone(),
+            });
             return Ok(());
         }
-
-        self.current_plan = Some(PartitionPlan::Simple {
-            device: disk.path.clone(),
-        });
-
-        Ok(())
     }
 
     pub fn run_manual_partitioning(&mut self) -> Result<()> {
-        ui::msgbox(
-            "Manual Partitioning Mode",
-            "You are entering manual partitioning shell.",
-        )?;
+        loop {
+            if !ui::yesno(
+                "Manual Partitioning",
+                "You are entering the manual partitioning shell.\n\n\
+                 Partition and format your drives, then mount everything under /mnt.\n\
+                 Type 'exit' or press Ctrl+D to return to the installer.\n\n\
+                 Do you want to continue?",
+            )? {
+                return Err(Error::Cancelled);
+            }
 
-        ui::clear();
+            ui::clear();
 
-        use ui::ansi::*;
+            use ui::ansi::*;
 
-        println!(
-            "MANUAL PARTITIONING\n\n\
-             Type 'exit' or press Ctrl+D to return to installer.\n\n\
-             Please parition and format the drives manually.\n\
-             Available tools: {YELLOW}fdisk{RESET}, {YELLOW}cfdisk{RESET}, {YELLOW}gdisk{RESET}, {YELLOW}parted{RESET}, {YELLOW}mkfs.*{RESET}, {YELLOW}btrfs{RESET}, etc.\n\
-             Mount the devices under {YELLOW}/mnt{RESET} and return to the installer.\n\n"
-        );
+            println!(
+                "MANUAL PARTITIONING\n\n\
+                 Type 'exit' or press Ctrl+D to return to installer.\n\n\
+                 Please partition and format the drives manually.\n\
+                 Available tools: {YELLOW}fdisk{RESET}, {YELLOW}cfdisk{RESET}, {YELLOW}gdisk{RESET}, \
+                 {YELLOW}parted{RESET}, {YELLOW}mkfs.*{RESET}, {YELLOW}btrfs{RESET}, etc.\n\
+                 Mount the root filesystem under {YELLOW}/mnt{RESET} and return to the installer.\n"
+            );
 
-        let status = std::process::Command::new("bash")
-            .arg("--norc")
-            .env(
-                "PS1",
-                "[\\[\\e[36m\\]neoarch-installer manual partitioning\\[\\e[0m\\]]\\[\\n\\] - \\[\\e[33m\\]\\w \\[\\e[34m\\]# \\[\\e[0m\\]",
-            )
-            .status()?;
+            let status = std::process::Command::new("bash")
+                .arg("--norc")
+                .env(
+                    "PS1",
+                    "[\\[\\e[36m\\]neoarch-installer manual partitioning\\[\\e[0m\\]]\\[\\n\\] - \\[\\e[33m\\]\\w \\[\\e[34m\\]# \\[\\e[0m\\]",
+                )
+                .status()?;
 
-        if !status.success() {
-            ui::msgbox(
-                "Error",
-                &format!("Shell exited with status: {}", status.code().unwrap_or(-1)),
-            )?;
+            if !status.success() {
+                ui::msgbox(
+                    "Shell Error",
+                    &format!("Shell exited with status: {}", status.code().unwrap_or(-1)),
+                )?;
+            }
+
+            self.refresh_devices()?;
+
+            let plan = match detect_manual_partitioning() {
+                Ok(p) => p,
+                Err(Error::Serialization(_)) => {
+                    ui::msgbox("Partition Detection Error", "No paritions detected")?;
+                    if ui::yesno(
+                        "Retry",
+                        "Return to the partitioning shell to fix the issue?",
+                    )
+                    .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    return Err(Error::Cancelled);
+                }
+                Err(e) => {
+                    ui::msgbox(
+                        "Partition Detection Error",
+                        &format!("Failed to read mounts: {e}"),
+                    )?;
+                    if ui::yesno(
+                        "Retry",
+                        "Return to the partitioning shell to fix the issue?",
+                    )
+                    .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    return Err(Error::Cancelled);
+                }
+            };
+
+            let msg = format!("{}\n\nProceed with this layout?", plan.summary());
+            match ui::yesno("Confirm Partition Layout", &msg) {
+                Ok(true) => {
+                    self.current_plan = Some(plan);
+                    return Ok(());
+                }
+                Ok(false) => continue,
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(e) => return Err(e),
+            }
         }
-
-        self.refresh_devices()?;
-
-        let plan = detect_manual_partitioning()?;
-
-        self.current_plan = Some(plan);
-
-        Ok(())
     }
 }
 
@@ -377,6 +425,9 @@ impl PartitionPlan {
         let mut commands = Vec::new();
 
         if let PartitionPlan::Simple { device } = self {
+            // unmount anything left over from a previous attempt
+            commands.push(cmdp!("bash", "-c", "umount -R /mnt 2>/dev/null || true"));
+
             // remove GPT
             commands.push(cmdp!("wipefs", "-af", device.clone()));
             commands.push(cmdp!("sgdisk", "--zap-all", device.clone()));
@@ -479,6 +530,58 @@ impl PartitionPlan {
         }
 
         commands
+    }
+
+    pub fn summary(&self) -> String {
+        match self {
+            PartitionPlan::Simple { device } => {
+                format!(
+                    "Simple layout on {device}:\n\
+                     - {p1} (1 GB, FAT32) → /boot/efi\n\
+                     - {p2} (Btrfs) with subvolumes:\n\
+                     {subvols}",
+                    p1 = device_part(device, 1),
+                    p2 = device_part(device, 2),
+                    subvols = SIMPLE_PARTITIONING_SUBVOLUMES
+                        .iter()
+                        .map(|(name, path)| format!(
+                            "  +-- {name} ({})",
+                            if *path == "/" { "root" } else { path }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+            PartitionPlan::Manual {
+                partitions,
+                btrfs_subvolumes,
+            } => {
+                let mut lines = Vec::new();
+
+                let mut sorted = partitions.clone();
+                sorted.sort_by(|a, b| a.device_path.cmp(&b.device_path));
+
+                for p in &sorted {
+                    let mount = p
+                        .mountpoint
+                        .as_deref()
+                        .map_or(String::new(), |m| format!(" → {m}"));
+                    lines.push(format!("  {}  [{}]{}", p.device_path, p.filesystem, mount));
+                }
+
+                if !btrfs_subvolumes.is_empty() {
+                    lines.push(String::new());
+                    lines.push("  Btrfs subvolumes:".into());
+                    let mut svols = btrfs_subvolumes.clone();
+                    svols.sort_by(|a, b| a.mountpoint.cmp(&b.mountpoint));
+                    for sv in &svols {
+                        lines.push(format!("    {}  → {}", sv.name, sv.mountpoint));
+                    }
+                }
+
+                format!("Detected layout:\n\n{}", lines.join("\n"))
+            }
+        }
     }
 
     pub fn dry_run_commands(&self) -> String {

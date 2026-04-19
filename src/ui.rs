@@ -136,6 +136,7 @@ pub fn passwordbox(title: &str, prompt: &str) -> Result<String> {
 pub fn programbox_start(title: &str, text: &str) -> Result<std::process::Child> {
     let child = Command::new(DIALOG)
         .args([
+            "--keep-tite",
             "--title",
             title,
             "--clear",

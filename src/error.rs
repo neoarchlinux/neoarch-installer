@@ -21,11 +21,21 @@ pub enum Error {
     #[error("No root filesystem mounted at /mnt")]
     ValidationMissingRoot,
 
+    #[error("No EFI filesystem mounted at /mnt/boot/efi")]
+    ValidationMissingEFI,
+
     #[error("Partition plan missing")]
     PartitionPlanMissing,
 
-    #[error("An error occured during the installation. Latest command: {0}")]
-    InstallError(String),
+    #[error("Command failed: {cmd}")]
+    InstallCommandFailed {
+        cmd: String,
+        stdout: String,
+        stderr: String,
+    },
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
